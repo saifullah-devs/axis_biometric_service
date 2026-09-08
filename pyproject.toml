@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "axis-biometric-service"
+version = "1.0.0"
+description = "High-Performance Face Biometrics & Liveness Microservice for Axis Pharma"
+authors = ["Saif Ullah <dev@axispharma.com>"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.13"
+fastapi = "^0.115.0"
+uvicorn = {extras = ["standard"], version = "^0.30.0"}
+insightface = "^0.7.3"
+onnxruntime = "^1.18.0"
+opencv-python-headless = "^4.10.0.84"
+numpy = "^1.26.4"
+python-multipart = "^0.0.9"
+pydantic-settings = "^2.4.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
