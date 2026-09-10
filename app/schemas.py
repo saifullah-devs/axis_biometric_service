@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -41,6 +41,24 @@ class FaceVerificationResponse(BaseResponse):
         ...,
         description="HIGH, MEDIUM, LOW, or REJECTED",
         examples=["HIGH"],
+    )
+
+
+class FaceLoginResponse(BaseResponse):
+    matched: bool = Field(
+        ..., description="True if a matching face met the HIGH tier threshold"
+    )
+    role: Optional[str] = Field(
+        None, description="Matched role: CUSTOMER, ADMIN, or GUEST"
+    )
+    identifier: Optional[str] = Field(
+        None, description="Matched CNIC (Customer) or Username (Admin/Guest)"
+    )
+    similarity_score: Optional[float] = Field(
+        None, description="Achieved cosine similarity score"
+    )
+    user_data: Optional[dict] = Field(
+        None, description="Session payload returned from ORDS on success"
     )
 
 

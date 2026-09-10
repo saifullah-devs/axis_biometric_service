@@ -1,6 +1,7 @@
 import json
-from contextlib import asynccontextmanager
+import httpx
 import numpy as np
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -9,6 +10,7 @@ from app.engine import engine
 from app.schemas import (
     FaceRegistrationResponse,
     FaceVerificationResponse,
+    FaceLoginResponse,
     HealthCheckResponse,
 )
 
@@ -18,9 +20,6 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[-] Starting Axis Biometric Microservice...")
-    print(
-        f"[-] Loading {settings.INSIGHTFACE_MODEL_NAME} using {settings.EXECUTION_PROVIDER}..."
-    )
     engine.initialize()
     print("[+] Model loaded and Biometric Engine is ready.")
     yield
@@ -30,22 +29,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
-    description="""
-    ## Axis Pharmaceuticals - Biometric Verification Engine
-    
-    Provides high-assurance facial embedding extraction and verification powered by ArcFace deep neural networks.
-    
-    * **Multi-Angle Registration:** Fuses Frontal, Left (30°), and Right (30°) facial profiles into a robust 512-dimension unit vector.
-    * **1:1 Face Verification:** Compares live snapshot embeddings against stored Oracle/Postgres master vectors via Cosine Distance.
-    * **Anti-Spoofing Rules:** Enforces single-face isolation and minimum detection confidence thresholds.
-    """,
-    openapi_tags=[
-        {"name": "System", "description": "Liveness & Diagnostic endpoints"},
-        {
-            "name": "Biometrics",
-            "description": "Face registration and verification procedures",
-        },
-    ],
+    description="Biometric Engine for Customer, Admin, and Guest Face Authentication",
     lifespan=lifespan,
 )
 
@@ -58,13 +42,7 @@ app.add_middleware(
 )
 
 
-@app.get(
-    "/health",
-    response_model=HealthCheckResponse,
-    tags=["System"],
-    summary="Health and Readiness Check",
-    description="Validates server readiness and verifies that InsightFace models are loaded in memory.",
-)
+@app.get("/health", response_model=HealthCheckResponse, tags=["System"])
 async def health_check():
     return HealthCheckResponse(
         status="healthy" if engine.is_ready else "initializing",
@@ -79,31 +57,12 @@ async def health_check():
     response_model=FaceRegistrationResponse,
     tags=["Biometrics"],
     status_code=status.HTTP_201_CREATED,
-    summary="Register Face Profile (3-Angle Capture)",
-    description="""
-    Receives 3 distinct head poses captured from the Flutter camera stream:
-    1. **center_frame:** Neutral frontal pose (Yaw ~ 0°)
-    2. **left_frame:** Head rotated ~20° to 35° Left
-    3. **right_frame:** Head rotated ~20° to 35° Right
-    
-    Averages vectors and returns a single 512-D unit array to be saved in the database.
-    """,
 )
 async def register_face(
-    cnic: str = Form(
-        ...,
-        description="User's unique national identifier",
-        examples=["33100-1234567-1"],
-    ),
-    center_frame: UploadFile = File(
-        ..., description="Front-facing image file (JPEG/PNG)"
-    ),
-    left_frame: UploadFile = File(
-        ..., description="Left-turned profile image file (JPEG/PNG)"
-    ),
-    right_frame: UploadFile = File(
-        ..., description="Right-turned profile image file (JPEG/PNG)"
-    ),
+    cnic: str = Form(...),
+    center_frame: UploadFile = File(...),
+    left_frame: UploadFile = File(...),
+    right_frame: UploadFile = File(...),
 ):
     master_vector = engine.combine_embeddings(
         center_bytes=await center_frame.read(),
@@ -124,22 +83,9 @@ async def register_face(
     "/api/v1/face/verify",
     response_model=FaceVerificationResponse,
     tags=["Biometrics"],
-    summary="Verify 1:1 Live Face Against Stored Profile",
-    description="""
-    Performs one-to-one cosine matching between a live snapshot and the user's stored master vector.
-    * Match threshold defaults to **0.68** (Bank standard, minimizing False Acceptance Rate).
-    """,
 )
 async def verify_face(
-    stored_embedding_json: str = Form(
-        ...,
-        description="JSON array string of exactly 512 floats fetched from the database",
-        examples=["[-0.0412, 0.0251, 0.0883]"],
-    ),
-    live_frame: UploadFile = File(
-        ...,
-        description="Live snapshot taken during authentication",
-    ),
+    stored_embedding_json: str = Form(...), live_frame: UploadFile = File(...)
 ):
     try:
         raw_list = json.loads(stored_embedding_json)
@@ -174,4 +120,134 @@ async def verify_face(
         similarity_score=round(score, 4),
         threshold=settings.SIMILARITY_THRESHOLD,
         confidence_tier=tier,
+    )
+
+
+@app.post(
+    "/api/v1/face/login",
+    response_model=FaceLoginResponse,
+    tags=["Biometrics"],
+    summary="Multi-Role Face-Only 1:N Search & Session Initializer",
+    description="""
+    Performs 1:N face identification scoped to the requested role (CUSTOMER, ADMIN, or GUEST).
+    Upon HIGH-tier match (>= 0.78), executes ORDS POST procedure to build the active session.
+    """,
+)
+async def face_login(
+    live_frame: UploadFile = File(...),
+    role: str = Form("CUSTOMER"),
+    device_id: str = Form("UNKNOWN"),
+    auth_token: str = Form("UNKNOWN"),
+    fcm_token: str = Form(""),
+):
+    normalized_role = role.strip().upper()
+
+    # 1. Fetch registered faces from ORDS filtered by the selected role
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.get(
+                settings.ORDS_FACE_LOGIN_URL,
+                params={"p_role": normalized_role},
+            )
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Failed to fetch {normalized_role} face database from ORDS.",
+                )
+            ords_data = response.json()
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Error connecting to ORDS GET endpoint: {str(e)}",
+            )
+
+    faces_list = ords_data.get("faces", [])
+    if not faces_list:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active registered face profiles found for role: {normalized_role}.",
+        )
+
+    # 2. Extract 512-D embedding from the incoming live camera snapshot
+    live_vector = engine.extract_embedding(await live_frame.read())
+
+    best_match_user = None
+    best_score = -1.0
+
+    # 3. Perform 1:N Cosine Distance search across candidates
+    for record in faces_list:
+        try:
+            emb_json = record.get("EMBEDDING_JSON")
+            if not emb_json:
+                continue
+
+            stored_list = json.loads(emb_json)
+            stored_vector = np.array(stored_list, dtype=np.float32)
+
+            if stored_vector.shape == (512,):
+                score = engine.compute_similarity(live_vector, stored_vector)
+                if score > best_score:
+                    best_score = score
+                    best_match_user = record
+        except Exception:
+            continue
+
+    # 4. Enforce strict HIGH-confidence threshold (>= 0.78)
+    HIGH_TIER_THRESHOLD = 0.78
+    if best_match_user and best_score >= HIGH_TIER_THRESHOLD:
+        matched_identifier = best_match_user.get(
+            "IDENTIFIER"
+        ) or best_match_user.get("CNIC_NO")
+        matched_role = (
+            best_match_user.get("ROLE") or normalized_role
+        ).upper()
+
+        # 5. Initialize active session in Oracle via ORDS POST
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                post_payload = {
+                    "P_IDENTIFIER": matched_identifier,
+                    "P_ROLE": matched_role,
+                    "P_DEVICE_ID": device_id,
+                    "P_AUTH_TOKEN": auth_token,
+                    "P_FCM_TOKEN": fcm_token,
+                }
+                ords_post_res = await client.post(
+                    settings.ORDS_FACE_LOGIN_URL, json=post_payload
+                )
+                session_data = ords_post_res.json()
+
+                if session_data.get("status") == "success":
+                    return FaceLoginResponse(
+                        success=True,
+                        message=f"{matched_role.capitalize()} face login successful.",
+                        matched=True,
+                        role=matched_role,
+                        identifier=matched_identifier,
+                        similarity_score=round(best_score, 4),
+                        user_data=session_data,
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=session_data.get(
+                            "message", "ORDS session creation failed."
+                        ),
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Error executing ORDS POST session creation: {str(e)}",
+                )
+
+    return FaceLoginResponse(
+        success=False,
+        message=f"No matching {normalized_role} face found or confidence below threshold.",
+        matched=False,
+        role=normalized_role,
+        similarity_score=round(best_score, 4) if best_score != -1.0 else 0.0,
     )
